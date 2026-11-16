@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="Bounce">
+<meta name="theme-color" content="#000000">
+<title>Bounce</title>
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%23000'/%3E%3Ccircle cx='50' cy='50' r='22' fill='%23F2EFE6'/%3E%3C/svg%3E">
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #000; overflow: hidden;
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  canvas { display: block; position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  const BALL = '#F2EFE6';           // off-white
+  const TEXT = 'rgba(242,239,230,';  // off-white with variable alpha
+  const POINTS_PER_BALL = 10;        // every 10 points, another ball drops in
+
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  let W = 0, H = 0, DPR = 1;
+  let R, G, BOUNCE_VY, SIDE_V;
+
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth; H = window.innerHeight;
+    cv.width = Math.round(W * DPR); cv.height = Math.round(H * DPR);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    R = Math.max(22, Math.min(W, H) * 0.08);   // ball radius (~34px on iPhone 16 Plus)
+    G = H * 2.4;                                // gravity, px/s^2 — tuned to feel like a real dropped ball
+    BOUNCE_VY = -Math.sqrt(2 * G * H * 0.45);   // a tap lifts the ball ~45% of the screen height
+    SIDE_V = W * 1.3;                           // max sideways speed from an off-centre tap
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  const load = (k) => { try { return parseInt(localStorage.getItem(k) || '0', 10) || 0; } catch (e) { return 0; } };
+  const save = (k, v) => { try { localStorage.setItem(k, String(v)); } catch (e) {} };
+  let best = load('bounce_best');
+  let bestBalls = load('bounce_best_balls');
+  let games = load('bounce_games');
+  let lifetime = load('bounce_lifetime');
+
+  let state = 'ready';   // ready | playing | over
+  let balls = [], rings = [], score = 0, nextSpawn = POINTS_PER_BALL, overAt = 0, newBest = false;
+  let playTime = 0, maxBalls = 1;
+
+  const mkBall = (x, y) => ({ x, y, vx: 0, vy: 0, sq: 0, sqv: 0, ang: 0 });
+
+  function reset() {
+    balls = [mkBall(W / 2, H / 2)];
+    rings = []; score = 0; nextSpawn = POINTS_PER_BALL; newBest = false;
+    playTime = 0; maxBalls = 1;
+    state = 'ready';
+  }
+
+  // ---- squash & stretch: a damped spring per ball ----
+  // sq > 0 squashes the ball along its impact axis, sq < 0 stretches it.
+  const SPRING_K = 900, SPRING_C = 13;
+  function impact(b, nx, ny, strength) {
+    if (strength <= 0.4) return;
+    b.ang = Math.atan2(ny, nx);
+    b.sqv = Math.max(b.sqv, 0) + Math.min(strength, 8);
+  }
+  function springStep(b, dt) {
+    b.sqv += (-SPRING_K * b.sq - SPRING_C * b.sqv) * dt;
+    b.sq += b.sqv * dt;
+    if (b.sq > 0.38) { b.sq = 0.38; b.sqv = Math.min(b.sqv, 0); }
+    if (b.sq < -0.3) { b.sq = -0.3; b.sqv = Math.max(b.sqv, 0); }
+  }
+  reset();
+
+  function spawnBall() {
+    const x = R + Math.random() * (W - 2 * R);
+    balls.push(mkBall(x, -R * 1.5));
+  }
+
+  // ---- input (multi-touch: each finger is its own pointer) ----
+  cv.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    const tx = e.clientX, ty = e.clientY;
+
+    if (state === 'ready') { state = 'playing'; return; }
+    if (state === 'over') {
+      if (performance.now() - overAt > 700) reset();
+      return;
+    }
+
+    // find the nearest ball within a forgiving touch radius
+    let hit = null, hd = Infinity;
+    for (const b of balls) {
+      const d = Math.hypot(tx - b.x, ty - b.y);
+      if (d < R * 1.75 && d < hd) { hit = b; hd = d; }
+    }
+    if (!hit) return;
+
+    // tap left of centre -> ball goes right, and vice versa
+    const off = Math.max(-1, Math.min(1, (tx - hit.x) / (R * 1.4)));
+    hit.vx = -off * SIDE_V;
+    hit.vy = BOUNCE_VY;
+    // squash along the line from the tap point through the ball
+    const ix = hit.x - tx, iy = hit.y - ty, il = Math.hypot(ix, iy);
+    if (il < R * 0.15) impact(hit, 0, 1, 7.5);
+    else impact(hit, ix / il, iy / il, 7.5);
+    rings.push({ x: tx, y: ty, t: 0 });
+
+    score++;
+    if (score >= nextSpawn) { spawnBall(); nextSpawn += POINTS_PER_BALL; }
+  }, { passive: false });
+
+  ['touchstart', 'touchmove', 'touchend', 'gesturestart', 'dblclick'].forEach(ev =>
+    document.addEventListener(ev, e => e.preventDefault(), { passive: false }));
+
+  // ---- physics ----
+  const WALL_E = 0.85, BALL_E = 0.92;
+
+  function step(dt) {
+    for (const b of balls) {
+      b.vy += G * dt;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      // side walls
+      if (b.x < R)     { impact(b, 1, 0, Math.abs(b.vx) / W * 5); b.x = R;     b.vx =  Math.abs(b.vx) * WALL_E; }
+      if (b.x > W - R) { impact(b, 1, 0, Math.abs(b.vx) / W * 5); b.x = W - R; b.vx = -Math.abs(b.vx) * WALL_E; }
+      springStep(b, dt);
+    }
+    // ball vs ball (equal mass, elastic-ish)
+    for (let i = 0; i < balls.length; i++) {
+      for (let j = i + 1; j < balls.length; j++) {
+        const a = balls[i], c = balls[j];
+        const dx = c.x - a.x, dy = c.y - a.y;
+        const d2 = dx * dx + dy * dy, min = 2 * R;
+        if (d2 >= min * min || d2 === 0) continue;
+        const d = Math.sqrt(d2), nx = dx / d, ny = dy / d;
+        const overlap = (min - d) / 2;
+        a.x -= nx * overlap; a.y -= ny * overlap;
+        c.x += nx * overlap; c.y += ny * overlap;
+        const rel = (c.vx - a.vx) * nx + (c.vy - a.vy) * ny;
+        if (rel < 0) {
+          const imp = -(1 + BALL_E) * rel / 2;
+          a.vx -= imp * nx; a.vy -= imp * ny;
+          c.vx += imp * nx; c.vy += imp * ny;
+          const k = -rel / H * 7;
+          impact(a, nx, ny, k); impact(c, nx, ny, k);
+        }
+      }
+    }
+    // fell off the bottom
+    balls = balls.filter(b => b.y - R <= H);
+  }
+
+  // ---- render ----
+  function draw() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    // tap rings
+    for (const r of rings) {
+      const a = 1 - r.t / 0.35;
+      ctx.strokeStyle = TEXT + (0.35 * a) + ')';
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(r.x, r.y, R * (0.6 + r.t * 3), 0, Math.PI * 2); ctx.stroke();
+    }
+
+    // drop indicator for a ball still above the screen
+    for (const b of balls) {
+      if (b.y + R < 0) {
+        ctx.fillStyle = TEXT + '0.5)';
+        ctx.beginPath();
+        ctx.moveTo(b.x - 8, 6); ctx.lineTo(b.x + 8, 6); ctx.lineTo(b.x, 16); ctx.closePath(); ctx.fill();
+      }
+    }
+
+    // balls
+    ctx.fillStyle = BALL;
+    for (const b of balls) {
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      ctx.rotate(b.ang);
+      ctx.scale(1 - b.sq, 1 + b.sq * 0.85);   // roughly volume-preserving
+      ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const font = (w, px) => `${w} ${px}px -apple-system, BlinkMacSystemFont, "SF Pro Display", Helvetica, Arial, sans-serif`;
+
+    if (state !== 'over') {
+      ctx.fillStyle = TEXT + (state === 'ready' ? '0.25)' : '0.85)');
+      ctx.font = font(200, Math.round(W * 0.16));
+      ctx.fillText(String(score), W / 2, H * 0.14);
+    }
+    if (state === 'ready') {
+      ctx.fillStyle = TEXT + '0.45)';
+      ctx.font = font(400, 15);
+      ctx.fillText('TAP TO START', W / 2, H / 2 + R + 44);
+      if (best > 0) ctx.fillText('BEST  ' + best, W / 2, H * 0.14 + W * 0.12);
+    }
+    if (state === 'over') {
+      const fade = Math.min(1, (performance.now() - overAt) / 400);
+      const cy = H * 0.36;
+      ctx.fillStyle = TEXT + (0.4 * fade) + ')';
+      ctx.font = font(500, 13);
+      ctx.fillText('G A M E   O V E R', W / 2, cy - W * 0.25);
+      ctx.fillStyle = TEXT + (0.95 * fade) + ')';
+      ctx.font = font(200, Math.round(W * 0.28));
+      ctx.fillText(String(score), W / 2, cy);
+
+      ctx.fillStyle = TEXT + ((newBest ? 0.95 : 0.55) * fade) + ')';
+      ctx.font = font(newBest ? 600 : 400, 15);
+      ctx.fillText(newBest ? 'NEW PERSONAL BEST' : 'PERSONAL BEST  ' + best, W / 2, cy + W * 0.2);
+
+      // stats row
+      const m = Math.floor(playTime / 60), sec = Math.floor(playTime % 60);
+      const stats = [
+        ['TIME', m + ':' + String(sec).padStart(2, '0')],
+        ['MOST BALLS', String(maxBalls)],
+        ['GAMES', String(games)],
+      ];
+      const sy = cy + W * 0.42;
+      ctx.strokeStyle = TEXT + (0.12 * fade) + ')';
+      ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(W * 0.12, sy - 38); ctx.lineTo(W * 0.88, sy - 38); ctx.stroke();
+      stats.forEach(([label, val], i) => {
+        const x = W * (0.2 + i * 0.3);
+        ctx.fillStyle = TEXT + (0.85 * fade) + ')';
+        ctx.font = font(300, 26);
+        ctx.fillText(val, x, sy);
+        ctx.fillStyle = TEXT + (0.35 * fade) + ')';
+        ctx.font = font(500, 10);
+        ctx.fillText(label, x, sy + 26);
+      });
+      ctx.fillStyle = TEXT + (0.35 * fade) + ')';
+      ctx.font = font(400, 12);
+      ctx.fillText('MOST BALLS EVER  ' + bestBalls + '     LIFETIME BOUNCES  ' + lifetime, W / 2, sy + 70);
+
+      if (performance.now() - overAt > 700) {
+        const pulse = 0.35 + 0.2 * Math.sin(performance.now() / 400);
+        ctx.fillStyle = TEXT + pulse + ')';
+        ctx.font = font(400, 15);
+        ctx.fillText('TAP TO PLAY AGAIN', W / 2, H * 0.86);
+      }
+    }
+  }
+
+  // ---- loop ----
+  let last = performance.now();
+  function frame(now) {
+    let dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+
+    if (state === 'playing') {
+      const sub = 6, h = dt / sub;
+      for (let i = 0; i < sub; i++) step(h);
+      playTime += dt;
+      maxBalls = Math.max(maxBalls, balls.length);
+      if (balls.length === 0) {
+        state = 'over'; overAt = now;
+        games++; lifetime += score;
+        if (score > best) { best = score; newBest = true; }
+        bestBalls = Math.max(bestBalls, maxBalls);
+        save('bounce_best', best); save('bounce_best_balls', bestBalls);
+        save('bounce_games', games); save('bounce_lifetime', lifetime);
+      }
+    } else {
+      for (const b of balls) springStep(b, dt);
+    }
+    for (const r of rings) r.t += dt;
+    rings = rings.filter(r => r.t < 0.35);
+
+    draw();
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
